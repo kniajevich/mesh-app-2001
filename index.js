@@ -133,4 +133,145 @@ wss.on('connection', (ws, req) => {
       case 'CONNECT':
         if (ws.user) break; // already authenticated
         if (!msg.token) {
-          ws.close(400
+          ws.close(4003, 'Authentication failed');
+          return;
+        }
+        try {
+          const payload = jwt.verify(msg.token, JWT_SECRET);
+          ws.user = payload;
+          console.log(`Client ${clientId} authenticated via CONNECT`);
+          ws.send(JSON.stringify({ type: 'CONNACK', status: 'OK' }));
+        } catch (e) {
+          console.warn(`Client ${clientId} failed auth via CONNECT`);
+          ws.close(4003, 'Authentication failed');
+          return;
+        }
+        break;
+
+      case 'SUBSCRIBE':
+        if (!ws.user) {
+          ws.send(JSON.stringify({ type: 'SUBACK', status: 'DENIED', reason: 'Not authenticated' }));
+          return;
+        }
+        if (!Array.isArray(msg.topics)) {
+          ws.send(JSON.stringify({ type: 'SUBACK', status: 'ERROR', reason: 'Invalid topics' }));
+          return;
+        }
+        const granted = [];
+        for (const topic of msg.topics) {
+          if (canSubscribe(ws.user, topic)) {
+            ws.subscriptions.add(topic);
+            granted.push({ topic, qos: 1 });
+          } else {
+            granted.push({ topic, qos: 0, reason: 'Access denied' });
+          }
+        }
+        ws.send(JSON.stringify({ type: 'SUBACK', status: 'OK', granted }));
+        break;
+
+      case 'UNSUBSCRIBE':
+        if (!Array.isArray(msg.topics)) return;
+        for (const topic of msg.topics) {
+          ws.subscriptions.delete(topic);
+        }
+        ws.send(JSON.stringify({ type: 'UNSUBACK', status: 'OK' }));
+        break;
+
+      case 'PUBLISH':
+        if (!ws.user) {
+          ws.send(JSON.stringify({ type: 'PUBACK', status: 'DENIED', reason: 'Not authenticated' }));
+          return;
+        }
+        if (!msg.topic || !msg.payload) {
+          ws.send(JSON.stringify({ type: 'PUBACK', status: 'ERROR', reason: 'Missing topic or payload' }));
+          return;
+        }
+        if (!canPublish(ws.user, msg.topic)) {
+          ws.send(JSON.stringify({ type: 'PUBACK', status: 'DENIED', reason: 'Access denied' }));
+          return;
+        }
+
+        messagesPublished.inc();
+        const messageId = msg.messageId || uuidv4();
+        const qos = msg.qos || 0;
+
+        // Deliver to all subscribed clients
+        for (const client of clients) {
+          if (client === ws) continue;
+          if (!client.user) continue;
+          for (const sub of client.subscriptions) {
+            if (topicMatches(sub, msg.topic)) {
+              const delivery = {
+                type: 'PUBLISH',
+                topic: msg.topic,
+                payload: msg.payload,
+                qos: qos,
+                messageId: messageId,
+                timestamp: Date.now()
+              };
+              client.send(JSON.stringify(delivery));
+              messagesDelivered.inc();
+
+              if (qos === 1) {
+                // Track pending ACK
+                const timeout = setTimeout(() => {
+                  const pending = client.pending.get(messageId);
+                  if (pending) {
+                    pending.retries++;
+                    if (pending.retries >= MAX_RETRIES) {
+                      ackFailures.inc();
+                      client.pending.delete(messageId);
+                      console.warn(`ACK timeout for message ${messageId} to client ${client.id}`);
+                    } else {
+                      // Resend
+                      client.send(JSON.stringify(delivery));
+                    }
+                  }
+                }, ACK_TIMEOUT_MS);
+
+                client.pending.set(messageId, { msg: delivery, retries: 0, timeout });
+              }
+              break; // Only deliver once per client even if multiple subs match
+            }
+          }
+        }
+
+        if (qos === 1) {
+          ws.send(JSON.stringify({ type: 'PUBACK', status: 'OK', messageId }));
+        }
+        break;
+
+      case 'PUBACK':
+        if (msg.messageId) {
+          const pending = ws.pending.get(msg.messageId);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            ws.pending.delete(msg.messageId);
+          }
+        }
+        break;
+
+      default:
+        console.warn(`Client ${clientId} sent unknown message type: ${msg.type}`);
+    }
+  });
+
+  ws.on('close', () => {
+    clients.delete(ws);
+    connectionsClosed.inc();
+    // Clear any pending timeouts
+    for (const [id, pending] of ws.pending) {
+      clearTimeout(pending.timeout);
+    }
+    ws.pending.clear();
+    console.log(`Client disconnected: ${clientId}`);
+  });
+
+  ws.on('error', (err) => {
+    console.error(`WebSocket error for client ${clientId}:`, err.message);
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`WebSocket Event Bus server listening on port ${PORT}`);
+});
